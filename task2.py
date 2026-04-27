@@ -2,11 +2,8 @@
 Task 2: Cracking bcrypt hashes from a shadow file
 CPE-321 Cryptographic Hash Functions Lab
 
-Strategy: dictionary attack using the NLTK word corpus (6-10 letter words),
-parallelised across all available CPU cores via multiprocessing.Pool.
-
 Usage:
-    python task2.py                        # crack ALL users (hours on high wf)
+    python task2.py                        # crack ALL users
     python task2.py --users Bilbo Gandalf  # crack specific users only
     python task2.py --wf-max 9             # only crack users with workfactor <= 9
 """
@@ -24,31 +21,21 @@ nltk.download('words', quiet=True)
 from nltk.corpus import words as nltk_words
 
 
-# ── Word list ─────────────────────────────────────────────────────────────────
-
-def build_wordlist() -> list[str]:
+def build_wordlist():
     """Filter NLTK corpus to lowercase words between 6 and 10 letters."""
-    wl = [w.lower() for w in nltk_words.words()
-          if w.isalpha() and 6 <= len(w) <= 10]
-    # deduplicate while preserving order
-    seen: set[str] = set()
+    seen = set()
     unique = []
-    for w in wl:
-        if w not in seen:
-            seen.add(w)
-            unique.append(w)
+    for w in nltk_words.words():
+        wl = w.lower()
+        if wl.isalpha() and 6 <= len(wl) <= 10 and wl not in seen:
+            seen.add(wl)
+            unique.append(wl)
     return unique
 
 
-# ── Shadow file parser ────────────────────────────────────────────────────────
-
-def parse_shadow(path: str) -> dict[str, bytes]:
-    """
-    Parse a shadow file of the form:
-        User:$2b$WF$<22-char-salt><hash>
-    Returns {username: full_hash_bytes}.
-    """
-    entries: dict[str, bytes] = {}
+def parse_shadow(path):
+    """Return {username: hash_bytes} from a shadow file."""
+    entries = {}
     for line in Path(path).read_text().splitlines():
         line = line.strip()
         if not line:
@@ -58,13 +45,8 @@ def parse_shadow(path: str) -> dict[str, bytes]:
     return entries
 
 
-# ── Per-process worker ────────────────────────────────────────────────────────
-
-def _try_chunk(chunk: list[str], stored_hash: bytes) -> str | None:
-    """
-    Called in a worker process.
-    Iterates over `chunk` and returns the matching word, or None.
-    """
+def _try_chunk(chunk, stored_hash):
+    """Worker: try each word in chunk, return matching word or None."""
     for word in chunk:
         try:
             if bcrypt.checkpw(word.encode(), stored_hash):
@@ -74,110 +56,79 @@ def _try_chunk(chunk: list[str], stored_hash: bytes) -> str | None:
     return None
 
 
-# ── Cracker ───────────────────────────────────────────────────────────────────
+def get_wf(h):
+    try:
+        return int(h.decode().split('$')[2])
+    except Exception:
+        return 99
 
-def crack_user(username: str, stored_hash: bytes,
-               wordlist: list[str], num_cores: int) -> tuple[str | None, float]:
-    """
-    Distribute `wordlist` across `num_cores` processes and return the
-    cracked password (or None) plus wall-clock time.
-    """
+
+def crack_user(username, stored_hash, wordlist, num_cores):
     chunk_size = max(1, len(wordlist) // num_cores)
     chunks = [wordlist[i:i + chunk_size]
               for i in range(0, len(wordlist), chunk_size)]
-
     worker = partial(_try_chunk, stored_hash=stored_hash)
-
-    start = time.perf_counter()
+    wf = get_wf(stored_hash)
+    print("  [{}] workfactor={}  cores={}  words={:,}".format(
+        username, wf, num_cores, len(wordlist)))
+    start = time.time()
     result = None
-
-    # Parse workfactor for ETA display
-    parts = stored_hash.decode().split('$')
-    wf = int(parts[2]) if len(parts) >= 3 else '?'
-    print(f"  [{username}] workfactor={wf}  cores={num_cores}  "
-          f"words={len(wordlist):,}  chunks={len(chunks)}")
-
     with mp.Pool(num_cores) as pool:
         for found in pool.imap_unordered(worker, chunks, chunksize=1):
             if found is not None:
                 result = found
                 pool.terminate()
                 break
+    return result, time.time() - start
 
-    elapsed = time.perf_counter() - start
-    return result, elapsed
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="bcrypt dictionary cracker")
-    parser.add_argument('--shadow', default='shadow.txt',
-                        help='Path to shadow file (default: shadow.txt)')
-    parser.add_argument('--users', nargs='+', default=None,
-                        help='Crack only these users (default: all)')
-    parser.add_argument('--wf-max', type=int, default=99,
-                        help='Skip users whose workfactor exceeds this value')
-    parser.add_argument('--cores', type=int, default=mp.cpu_count(),
-                        help=f'Number of CPU cores (default: {mp.cpu_count()})')
+    parser.add_argument('--shadow', default='shadow.txt')
+    parser.add_argument('--users', nargs='+', default=None)
+    parser.add_argument('--wf-max', type=int, default=99)
+    parser.add_argument('--cores', type=int, default=mp.cpu_count())
     args = parser.parse_args()
 
-    print(f"\n{'='*60}")
+    print("\n" + "="*60)
     print("TASK 2: bcrypt Dictionary Cracker")
-    print(f"{'='*60}")
-    print(f"  Shadow file : {args.shadow}")
-    print(f"  Cores       : {args.cores}")
-    print(f"  WF max      : {args.wf_max}\n")
+    print("="*60)
+    print("  Cores: {}  WF max: {}\n".format(args.cores, args.wf_max))
 
-    # Load resources
-    print("  Loading NLTK wordlist...", end=' ', flush=True)
+    print("  Loading NLTK wordlist...", end=' ')
+    sys.stdout.flush()
     wordlist = build_wordlist()
-    print(f"{len(wordlist):,} words (6-10 letters)")
+    print("{:,} words".format(len(wordlist)))
 
-    print("  Parsing shadow file...", end=' ', flush=True)
     shadow = parse_shadow(args.shadow)
-    print(f"{len(shadow)} users\n")
-
-    # Optionally filter users
     targets = args.users if args.users else list(shadow.keys())
     targets = [u for u in targets if u in shadow]
-
-    # Filter by workfactor
-    def get_wf(h: bytes) -> int:
-        try:
-            return int(h.decode().split('$')[2])
-        except Exception:
-            return 99
-
     targets = [u for u in targets if get_wf(shadow[u]) <= args.wf_max]
 
     if not targets:
-        print("  No matching users to crack. Adjust --users or --wf-max.")
+        print("No matching users. Adjust --users or --wf-max.")
         sys.exit(0)
 
-    print(f"  Cracking {len(targets)} user(s): {', '.join(targets)}\n")
+    print("  Cracking: {}\n".format(', '.join(targets)))
 
-    # Crack each user sequentially (parallelism is within each user's cracking)
-    results: list[tuple[str, str | None, float]] = []
+    results = []
     for username in targets:
-        print(f"  Cracking {username}...")
+        print("  Cracking {}...".format(username))
         pw, elapsed = crack_user(username, shadow[username], wordlist, args.cores)
-        status = f"'{pw}'" if pw else "NOT FOUND"
-        print(f"  → {username}: {status}  ({elapsed:.1f}s)\n")
+        status = "'{}'".format(pw) if pw else "NOT FOUND"
+        print("  -> {}  ({:.1f}s)\n".format(status, elapsed))
         results.append((username, pw, elapsed))
 
-    # Summary table
-    print(f"\n{'='*60}")
+    print("\n" + "="*60)
     print("RESULTS")
-    print(f"{'='*60}")
-    print(f"  {'User':<12}  {'Password':<16}  {'Time (s)':>10}")
-    print("  " + "-"*44)
+    print("="*60)
+    print("  {:<12}  {:<16}  {:>10}".format("User", "Password", "Time (s)"))
+    print("  " + "-"*42)
     for username, pw, elapsed in results:
-        pw_str = pw if pw else "NOT FOUND"
-        print(f"  {username:<12}  {pw_str:<16}  {elapsed:>10.1f}")
+        print("  {:<12}  {:<16}  {:>10.1f}".format(
+            username, pw if pw else "NOT FOUND", elapsed))
 
 
 if __name__ == '__main__':
-    # Required on macOS/Windows for multiprocessing
     mp.freeze_support()
     main()
